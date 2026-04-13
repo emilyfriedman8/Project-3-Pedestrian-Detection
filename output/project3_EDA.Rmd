@@ -1,0 +1,551 @@
+---
+title: 'Project 3 EDA'
+author: We Came, We Saw, We Modelled | Emily Friedman (Group Leader), Jensen Harvey,
+  Kaitlyn Chou
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: 2
+    number_sections: yes
+  html_document:
+    toc: yes
+    toc_depth: '2'
+    df_print: paged
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center",
+  fig.width  = 7,
+  fig.height = 4.5
+)
+```
+
+
+```{r}
+library(jsonlite)
+library(tidyverse)
+library(ggplot2)
+library(scales)
+library(patchwork)
+```
+
+------------------------------------------------------------------------
+
+# Data Loading
+
+```{r}
+data_dir <- "/Users/jensen.harvey/Desktop/data science/project3/data"
+
+json_files <- list.files(
+  path      = data_dir,
+  pattern   = "gtBboxCityPersons\\.json$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+cat("Total annotation files found:", length(json_files), "\n")
+
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+parse_bbox_file <- function(filepath) {
+  parts <- strsplit(filepath, "/")[[1]]
+  n     <- length(parts)
+  city  <- parts[n - 1]
+  split <- parts[n - 2]
+
+  ann <- tryCatch(fromJSON(filepath, simplifyVector = FALSE), error = function(e) NULL)
+  if (is.null(ann)) return(NULL)
+
+  img_w <- ann$imgWidth  %||% NA_integer_
+  img_h <- ann$imgHeight %||% NA_integer_
+
+  objects <- ann$objects
+  if (is.null(objects) || length(objects) == 0) {
+    return(data.frame(
+      file       = filepath,
+      split      = split,
+      city       = city,
+      img_width  = img_w,
+      img_height = img_h,
+      label      = NA_character_,
+      bbox_x     = NA_real_,
+      bbox_y     = NA_real_,
+      bbox_w     = NA_real_,
+      bbox_h     = NA_real_,
+      bbox_vis_w = NA_real_,
+      bbox_vis_h = NA_real_,
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  rows <- lapply(objects, function(o) {
+    bbox     <- o$bbox    %||% list(0, 0, 0, 0)
+    bbox_vis <- o$bboxVis %||% list(0, 0, 0, 0)
+    data.frame(
+      file       = filepath,
+      split      = split,
+      city       = city,
+      img_width  = img_w,
+      img_height = img_h,
+      label      = o$label %||% NA_character_,
+      bbox_x     = bbox[[1]],
+      bbox_y     = bbox[[2]],
+      bbox_w     = bbox[[3]],
+      bbox_h     = bbox[[4]],
+      bbox_vis_w = bbox_vis[[3]],
+      bbox_vis_h = bbox_vis[[4]],
+      stringsAsFactors = FALSE
+    )
+  })
+  do.call(rbind, rows)
+}
+
+annotations <- map_dfr(json_files, parse_bbox_file)
+
+cat("Total annotated object rows:", nrow(annotations), "\n")
+cat("Unique images:", n_distinct(annotations$file), "\n")
+cat("Splits:", paste(sort(unique(annotations$split)), collapse = ", "), "\n")
+cat("Cities:", paste(sort(unique(annotations$city)), collapse = ", "), "\n")
+```
+
+------------------------------------------------------------------------
+
+# Dataset Overview
+
+## Image Count by Split
+
+```{r}
+images_df <- annotations %>%
+  distinct(file, split, city, img_width, img_height)
+
+split_counts <- images_df %>%
+  count(split, name = "n_images") %>%
+  arrange(desc(n_images))
+
+split_counts
+
+ggplot(split_counts, aes(x = reorder(split, -n_images), y = n_images, fill = split)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(aes(label = comma(n_images)), vjust = -0.4, size = 4) +
+  scale_fill_manual(values = c("train" = "#2c7bb6", "val" = "#d7191c")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)), labels = comma) +
+  labs(
+    title = "Number of Images per Dataset Split",
+    x     = "Split",
+    y     = "Image Count"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## Image Count by City
+
+```{r}
+city_counts <- images_df %>%
+  count(city, split, name = "n_images")
+
+ggplot(city_counts, aes(x = reorder(city, n_images), y = n_images, fill = split)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_fill_manual(values = c("train" = "#2c7bb6", "val" = "#d7191c")) +
+  labs(
+    title = "Image Count by City and Split",
+    x     = "City",
+    y     = "Number of Images",
+    fill  = "Split"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+------------------------------------------------------------------------
+
+# Label Distribution
+
+```{r}
+label_counts <- annotations %>%
+  filter(!is.na(label)) %>%
+  count(label, name = "n_objects") %>%
+  arrange(desc(n_objects))
+
+label_counts
+
+ggplot(label_counts, aes(x = reorder(label, n_objects), y = n_objects, fill = label)) +
+  geom_col(width = 0.65, show.legend = FALSE) +
+  geom_text(aes(label = comma(n_objects)), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2)), labels = comma) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Annotation Label Counts Across All Images",
+    x     = "Label",
+    y     = "Number of Annotated Objects"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## Person Annotations vs. Ignore Regions
+
+```{r}
+annotations <- annotations %>%
+  mutate(
+    is_ignore = grepl("ignore", label, ignore.case = TRUE),
+    is_person = !is_ignore & !is.na(label)
+  )
+
+type_summary <- annotations %>%
+  filter(!is.na(label)) %>%
+  count(is_ignore) %>%
+  mutate(
+    type = ifelse(is_ignore, "Ignore Region", "Person Annotation"),
+    pct  = n / sum(n)
+  )
+
+ggplot(type_summary, aes(x = type, y = n, fill = type)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(aes(label = paste0(comma(n), "\n(", percent(pct, accuracy = 0.1), ")")),
+            vjust = -0.3, size = 4) +
+  scale_fill_manual(values = c("Person Annotation" = "#d73027",
+                               "Ignore Region"     = "#878787")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.18)), labels = comma) +
+  labs(
+    title = "Person Annotations vs. Ignore Regions",
+    x     = NULL, y = "Count"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+------------------------------------------------------------------------
+
+# Pedestrian Presence per Image (Binary Target Variable)
+
+```{r}
+image_level <- annotations %>%
+  group_by(file, split, city, img_width, img_height) %>%
+  summarise(
+    n_persons        = sum(is_person,  na.rm = TRUE),
+    n_ignore_regions = sum(is_ignore,  na.rm = TRUE),
+    has_pedestrian   = any(is_person,  na.rm = TRUE),
+    .groups = "drop"
+  )
+
+presence_summary <- image_level %>%
+  count(has_pedestrian) %>%
+  mutate(
+    label = ifelse(has_pedestrian, "Has Pedestrian", "No Pedestrian"),
+    pct   = n / sum(n)
+  )
+
+presence_summary
+
+ggplot(presence_summary, aes(x = label, y = n, fill = label)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(aes(label = paste0(comma(n), "\n(", percent(pct, accuracy = 0.1), ")")),
+            vjust = -0.3, size = 4.2) +
+  scale_fill_manual(values = c("Has Pedestrian" = "#d73027",
+                               "No Pedestrian"  = "#4575b4")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.18)), labels = comma) +
+  labs(
+    title    = "Image-Level Pedestrian Presence",
+    subtitle = "Binary target variable for Faster R-CNN detection model",
+    x = NULL, y = "Number of Images"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## Presence Rate by Split
+
+```{r}
+split_presence <- image_level %>%
+  group_by(split, has_pedestrian) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(label = ifelse(has_pedestrian, "Has Pedestrian", "No Pedestrian"))
+
+ggplot(split_presence, aes(x = split, y = n, fill = label)) +
+  geom_col(position = "fill", width = 0.5) +
+  scale_y_continuous(labels = percent) +
+  scale_fill_manual(values = c("Has Pedestrian" = "#d73027",
+                               "No Pedestrian"  = "#4575b4")) +
+  labs(
+    title = "Pedestrian Presence Rate by Split",
+    x = "Split", y = "Proportion of Images", fill = NULL
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+------------------------------------------------------------------------
+
+# Pedestrian Count per Image
+
+## Histogram
+
+```{r}
+image_level %>%
+  filter(has_pedestrian) %>%
+  ggplot(aes(x = n_persons)) +
+  geom_histogram(binwidth = 1, fill = "#d73027", color = "white") +
+  scale_x_continuous(breaks = pretty_breaks(n = 10)) +
+  labs(
+    title    = "Distribution of Person Count per Image",
+    subtitle = "Among images containing at least one person annotation",
+    x = "Number of Person Annotations", y = "Number of Images"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## Summary Statistics
+
+```{r}
+image_level %>%
+  summarise(
+    total_images           = n(),
+    images_with_pedestrian = sum(has_pedestrian),
+    images_without         = sum(!has_pedestrian),
+    pct_with_pedestrian    = mean(has_pedestrian),
+    mean_persons_all       = mean(n_persons),
+    mean_persons_ped_only  = mean(n_persons[has_pedestrian]),
+    median_persons_ped     = median(n_persons[has_pedestrian]),
+    max_persons            = max(n_persons)
+  ) %>%
+  pivot_longer(everything(), names_to = "Metric", values_to = "Value") %>%
+  mutate(Value = round(Value, 3))
+```
+
+------------------------------------------------------------------------
+
+# Bounding Box Analysis
+
+```{r}
+bbox_df <- annotations %>%
+  filter(is_person, !is.na(bbox_w), !is.na(bbox_h), bbox_w > 0, bbox_h > 0) %>%
+  mutate(
+    bbox_area    = bbox_w * bbox_h,
+    aspect_ratio = bbox_h / bbox_w,   
+    vis_area     = bbox_vis_w * bbox_vis_h,
+    visibility   = ifelse(bbox_area > 0, vis_area / bbox_area, NA_real_)
+  )
+```
+
+## Width, Height, Area, and Aspect Ratio
+
+```{r}
+p1 <- ggplot(bbox_df, aes(x = bbox_w)) +
+  geom_histogram(bins = 40, fill = "#4575b4", color = "white") +
+  labs(title = "Bbox Width", x = "Width (px)", y = "Count") +
+  theme_minimal(base_size = 10)
+
+p2 <- ggplot(bbox_df, aes(x = bbox_h)) +
+  geom_histogram(bins = 40, fill = "#74add1", color = "white") +
+  labs(title = "Bbox Height", x = "Height (px)", y = "Count") +
+  theme_minimal(base_size = 10)
+
+p3 <- ggplot(bbox_df, aes(x = bbox_area)) +
+  geom_histogram(bins = 40, fill = "#f46d43", color = "white") +
+  scale_x_log10(labels = comma) +
+  labs(title = "Bbox Area (log scale)", x = "Area (px²)", y = "Count") +
+  theme_minimal(base_size = 10)
+
+p4 <- ggplot(bbox_df, aes(x = aspect_ratio)) +
+  geom_histogram(bins = 40, fill = "#fdae61", color = "white") +
+  labs(title = "Aspect Ratio (H/W)", x = "H / W", y = "Count") +
+  theme_minimal(base_size = 10)
+
+(p1 + p2) / (p3 + p4)
+```
+
+## Visibility (Occlusion)
+
+```{r}
+bbox_df %>%
+  filter(visibility >= 0, visibility <= 1) %>%
+  ggplot(aes(x = visibility)) +
+  geom_histogram(bins = 30, fill = "#1a9641", color = "white") +
+  scale_x_continuous(labels = percent) +
+  labs(
+    title    = "Pedestrian Visibility Distribution",
+    subtitle = "Fraction of bounding box that is unoccluded",
+    x = "Visibility Fraction", y = "Count"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## Bounding Box Summary Statistics
+
+```{r}
+bbox_df %>%
+  summarise(
+    n_person_annotations = n(),
+    mean_width           = mean(bbox_w),
+    median_width         = median(bbox_w),
+    mean_height          = mean(bbox_h),
+    median_height        = median(bbox_h),
+    mean_area            = mean(bbox_area),
+    median_area          = median(bbox_area),
+    mean_aspect_ratio    = mean(aspect_ratio),
+    mean_visibility      = mean(visibility, na.rm = TRUE)
+  ) %>%
+  pivot_longer(everything(), names_to = "Metric", values_to = "Value") %>%
+  mutate(Value = round(Value, 2))
+```
+
+------------------------------------------------------------------------
+
+# City-Level Analysis
+
+## Pedestrian Presence Rate by City
+
+```{r}
+city_stats <- image_level %>%
+  group_by(city, split) %>%
+  summarise(
+    n_images     = n(),
+    n_with_ped   = sum(has_pedestrian),
+    pct_with_ped = mean(has_pedestrian),
+    avg_persons  = mean(n_persons),
+    .groups      = "drop"
+  )
+
+ggplot(city_stats, aes(x = reorder(city, pct_with_ped),
+                       y = pct_with_ped, fill = split)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = percent(pct_with_ped, accuracy = 1)),
+            hjust = -0.1, size = 2.8) +
+  coord_flip() +
+  scale_y_continuous(labels = percent, expand = expansion(mult = c(0, 0.18))) +
+  scale_fill_manual(values = c("train" = "#2c7bb6", "val" = "#d7191c")) +
+  labs(
+    title = "Pedestrian Presence Rate by City",
+    x = "City", y = "% Images with >1 Person", fill = "Split"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+## Average Person Count by City
+
+```{r}
+ggplot(city_stats, aes(x = reorder(city, avg_persons), y = avg_persons, fill = split)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_fill_manual(values = c("train" = "#2c7bb6", "val" = "#d7191c")) +
+  labs(
+    title = "Average Person Annotations per Image, by City",
+    x = "City", y = "Mean Person Count", fill = "Split"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+------------------------------------------------------------------------
+
+# Class Imbalance Assessment
+
+```{r}
+imbalance <- image_level %>%
+  count(has_pedestrian) %>%
+  mutate(
+    class = ifelse(has_pedestrian, "Positive (pedestrian)", "Negative (no pedestrian)"),
+    pct   = n / sum(n)
+  )
+
+imbalance %>% select(class, n, pct) %>% mutate(pct = percent(pct, accuracy = 0.1))
+
+ratio <- max(imbalance$n) / min(imbalance$n)
+cat("Imbalance ratio (majority:minority):", round(ratio, 2), "\n")
+cat(ifelse(ratio > 3,
+  ">> Ratio > 3:1 — consider class-weighted loss or oversampling.",
+  ">> Ratio <= 3:1 — class balance is acceptable for standard training."), "\n")
+```
+
+------------------------------------------------------------------------
+
+# Image Dimensions
+
+```{r}
+dims_df <- images_df %>% filter(!is.na(img_width), !is.na(img_height))
+
+pw <- ggplot(dims_df, aes(x = img_width)) +
+  geom_histogram(bins = 20, fill = "#4575b4", color = "white") +
+  labs(title = "Image Width Distribution", x = "Width (px)", y = "Count") +
+  theme_minimal(base_size = 11)
+
+ph <- ggplot(dims_df, aes(x = img_height)) +
+  geom_histogram(bins = 20, fill = "#74add1", color = "white") +
+  labs(title = "Image Height Distribution", x = "Height (px)", y = "Count") +
+  theme_minimal(base_size = 11)
+
+pw + ph
+```
+
+```{r}
+dims_df %>%
+  summarise(
+    unique_resolutions = n_distinct(paste(img_width, img_height)),
+    most_common_width  = as.integer(names(sort(table(img_width),  decreasing = TRUE)[1])),
+    most_common_height = as.integer(names(sort(table(img_height), decreasing = TRUE)[1])),
+    min_width = min(img_width),  max_width = max(img_width),
+    min_height = min(img_height), max_height = max(img_height)
+  )
+```
+
+------------------------------------------------------------------------
+
+# Missing / Data Quality Check
+
+```{r}
+annotations %>%
+  summarise(
+    pct_missing_label    = mean(is.na(label)),
+    pct_missing_bbox_w   = mean(is.na(bbox_w)),
+    pct_missing_bbox_h   = mean(is.na(bbox_h)),
+    pct_missing_img_dims = mean(is.na(img_width) | is.na(img_height))
+  ) %>%
+  pivot_longer(everything(), names_to = "Field", values_to = "Pct_Missing") %>%
+  mutate(Pct_Missing = percent(Pct_Missing, accuracy = 0.01))
+```
+
+------------------------------------------------------------------------
+
+# EDA Summary Table
+
+```{r}
+tibble(
+  Metric = c(
+    "Total annotation files (images)",
+    "Train images",
+    "Validation images",
+    "Cities represented",
+    "Total person annotations (non-ignore)",
+    "Total ignore-region annotations",
+    "Images with >1 pedestrian",
+    "Images without pedestrian",
+    "Pedestrian presence rate",
+    "Mean persons per image (all)",
+    "Mean persons per image (ped only)",
+    "Class imbalance ratio"
+  ),
+  Value = c(
+    comma(n_distinct(annotations$file)),
+    comma(sum(images_df$split == "train")),
+    comma(sum(images_df$split == "val")),
+    as.character(n_distinct(annotations$city)),
+    comma(sum(annotations$is_person, na.rm = TRUE)),
+    comma(sum(annotations$is_ignore, na.rm = TRUE)),
+    comma(sum(image_level$has_pedestrian)),
+    comma(sum(!image_level$has_pedestrian)),
+    percent(mean(image_level$has_pedestrian), accuracy = 0.1),
+    as.character(round(mean(image_level$n_persons), 2)),
+    as.character(round(mean(image_level$n_persons[image_level$has_pedestrian]), 2)),
+    as.character(round(ratio, 2))
+  )
+)
+```
+
+------------------------------------------------------------------------
+
+*Data: Cityscapes Dataset --- gtBboxCityPersons annotations (Cordts et
+al., 2016)*

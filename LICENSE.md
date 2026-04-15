@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 KC-Night, emilyfriedman8, jensen-harvey
+Copyright (c) 2026 emilyfriedman8, KC-Night, jensen-harvey
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
